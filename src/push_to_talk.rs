@@ -37,6 +37,7 @@ impl Keybind {
     /// The key a key press names, unless it has no scan code.
     pub fn recorded(event: &KeyEvent) -> Option<Self> {
         let scancode = event.physical_key.to_scancode()?;
+        RECORDED.store(scancode, Ordering::Relaxed);
         Some(Self {
             scancode,
             name: name(event),
@@ -255,6 +256,10 @@ static DOWN: [AtomicBool; 4] = [
 ];
 /// Whether the window's own key events stand in for global keys.
 static FOCUSED: AtomicBool = AtomicBool::new(false);
+/// Whether settings are waiting for the next key to record it.
+static RECORDING: AtomicBool = AtomicBool::new(false);
+/// The scan code of the key just pressed to record a keybind, until it comes up.
+static RECORDED: AtomicU32 = AtomicU32::new(NONE);
 /// The action whose key the window's latest key press was, as an index into
 /// [`Action::ALL`]; [`NONE`] if it wasn't one.
 static PRESSED: AtomicU32 = AtomicU32::new(NONE);
@@ -262,6 +267,16 @@ static PRESSED: AtomicU32 = AtomicU32::new(NONE);
 type Handler = Arc<dyn Fn(Action) + Send + Sync>;
 /// What hears each press of a keybind other than push to talk.
 static HANDLER: Mutex<Option<Handler>> = Mutex::new(None);
+
+/// Tells the watcher whether settings are recording a key, so pressing a key
+/// to record it doesn't also act on its current keybind.
+pub fn set_recording(recording: bool) {
+    RECORDING.store(recording, Ordering::Relaxed);
+}
+
+fn release_recorded(scancode: u32) {
+    let _ = RECORDED.compare_exchange(scancode, NONE, Ordering::Relaxed, Ordering::Relaxed);
+}
 
 fn bind(action: Action, scancode: Option<u32>) {
     KEYS[action.index()].store(scancode.unwrap_or(NONE), Ordering::Relaxed);
@@ -280,11 +295,19 @@ fn action_for(scancode: u32) -> Option<Action> {
 /// A watched key went down or came up. Push to talk follows the key; the
 /// other keybinds act as it goes down, and not again until it comes up.
 fn press(action: Action, down: bool) {
+    if !down {
+        RECORDED.store(NONE, Ordering::Relaxed);
+    }
+    let recorded = RECORDED.load(Ordering::Relaxed);
+    let suppressed = down
+        && (RECORDING.load(Ordering::Relaxed)
+            || (recorded != NONE
+                && KEYS[action.index()].load(Ordering::Relaxed) == recorded));
     if action == Action::PushToTalk {
-        yapfast_core::push_to_talk::hold(down);
+        yapfast_core::push_to_talk::hold(down && !suppressed);
         return;
     }
-    if DOWN[action.index()].swap(down, Ordering::Relaxed) != down && down {
+    if DOWN[action.index()].swap(down, Ordering::Relaxed) != down && down && !suppressed {
         let handler = HANDLER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -296,6 +319,7 @@ fn press(action: Action, down: bool) {
 }
 
 fn release_all() {
+    RECORDED.store(NONE, Ordering::Relaxed);
     for action in Action::ALL {
         press(action, false);
     }
@@ -309,29 +333,40 @@ pub fn pressed_key() -> Option<Action> {
         .copied()
 }
 
-/// Presses the keys from the window's own events while no global key works.
-/// Losing the focus lets them go, as their release won't come.
-pub fn window_event(event: &WindowEvent) {
-    if let WindowEvent::KeyboardInput { event, .. } = event
-        && event.state == ElementState::Pressed
-    {
-        let action = event.physical_key.to_scancode().and_then(action_for);
-        PRESSED.store(
-            action.map_or(NONE, |action| action.index() as u32),
-            Ordering::Relaxed,
-        );
-    }
-    if !FOCUSED.load(Ordering::Relaxed) {
-        return;
-    }
+/// Presses the keys from the window's own events, and tells which watched
+/// action a key event belongs to. Losing the focus while no global key works
+/// lets held keys go, as their release won't come.
+pub fn window_event(event: &WindowEvent) -> Option<Action> {
     match event {
-        WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
-            if let Some(action) = event.physical_key.to_scancode().and_then(action_for) {
+        WindowEvent::KeyboardInput { event, .. } => {
+            let scancode = event.physical_key.to_scancode();
+            if event.state == ElementState::Released
+                && let Some(scancode) = scancode
+            {
+                release_recorded(scancode);
+            }
+            let action = scancode.and_then(action_for);
+            if event.state == ElementState::Pressed {
+                PRESSED.store(
+                    action.map_or(NONE, |action| action.index() as u32),
+                    Ordering::Relaxed,
+                );
+            }
+            if !event.repeat
+                && let Some(action) = action
+            {
                 press(action, event.state == ElementState::Pressed);
             }
+            action
         }
-        WindowEvent::Focused(false) => release_all(),
-        _ => {}
+        WindowEvent::Focused(false) => {
+            RECORDED.store(NONE, Ordering::Relaxed);
+            if FOCUSED.load(Ordering::Relaxed) {
+                release_all();
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -750,8 +785,11 @@ mod linux {
                                 }
                             }
                             Ok(Event::XinputRawKeyRelease(event)) => {
-                                if let Some(action) = action(event.detail) {
-                                    super::press(action, false);
+                                if let Some(scancode) = event.detail.checked_sub(8) {
+                                    super::release_recorded(scancode);
+                                    if let Some(action) = super::action_for(scancode) {
+                                        super::press(action, false);
+                                    }
                                 }
                             }
                             Ok(_) => {}
@@ -1057,7 +1095,11 @@ mod windows {
             } else {
                 0
             };
-            if let Some(action) = super::action_for(key.scanCode | extended) {
+            let scancode = key.scanCode | extended;
+            if matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP) {
+                super::release_recorded(scancode);
+            }
+            if let Some(action) = super::action_for(scancode) {
                 match wparam as u32 {
                     WM_KEYDOWN | WM_SYSKEYDOWN => super::press(action, true),
                     WM_KEYUP | WM_SYSKEYUP => super::press(action, false),
@@ -1156,6 +1198,26 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 1, "letting go acts on nothing");
         press(Action::ToggleMute, true);
         assert_eq!(count.load(Ordering::Relaxed), 2);
+        press(Action::ToggleMute, false);
+        set_recording(true);
+        press(Action::ToggleMute, true);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "pressing a key to record it does not act on its keybind"
+        );
+        RECORDED.store(7, Ordering::Relaxed);
+        set_recording(false);
+        press(Action::ToggleMute, true);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "holding the recorded key does not fire it until it comes up"
+        );
+        release_recorded(7);
+        press(Action::ToggleMute, false);
+        press(Action::ToggleMute, true);
+        assert_eq!(count.load(Ordering::Relaxed), 3);
         press(Action::ToggleMute, false);
         bind(Action::ToggleMute, None);
         assert_eq!(action_for(7), None);

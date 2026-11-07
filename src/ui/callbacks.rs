@@ -1568,6 +1568,9 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             if on {
                 window.set_keybind_recording(-1);
             }
+            crate::push_to_talk::set_recording(
+                window.get_talk_recording() || window.get_keybind_recording() >= 0,
+            );
         }
     });
     let weak = window.as_weak();
@@ -1577,6 +1580,9 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             if index >= 0 {
                 window.set_talk_recording(false);
             }
+            crate::push_to_talk::set_recording(
+                window.get_talk_recording() || window.get_keybind_recording() >= 0,
+            );
         }
     });
     let state = adapter.clone();
@@ -1588,6 +1594,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             .copied();
         if let (Some(window), Some(action)) = (weak.upgrade(), action) {
             window.set_keybind_recording(-1);
+            crate::push_to_talk::set_recording(false);
             state.borrow_mut().clear_keybind(&window, action);
         }
     });

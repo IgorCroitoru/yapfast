@@ -497,13 +497,13 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                         }
                     });
                 }
-                crate::push_to_talk::window_event(event);
                 // While recording a key for push to talk or a keybind, the
                 // next key becomes it, and Escape stops; either way only the
                 // recorder sees it.
                 if let WindowEvent::KeyboardInput { event: key, .. } = event
                     && key.state == ElementState::Pressed
                     && let Some(window) = weak.upgrade()
+                    && window.get_settings_open()
                     && (window.get_talk_recording() || window.get_keybind_recording() >= 0)
                 {
                     if !key.repeat {
@@ -511,11 +511,12 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                             .ok()
                             .and_then(|index| crate::push_to_talk::Action::TOGGLES.get(index))
                             .copied();
-                        window.set_talk_recording(false);
-                        window.set_keybind_recording(-1);
                         let recorded = (key.logical_key != Key::Named(NamedKey::Escape))
                             .then(|| crate::push_to_talk::Keybind::recorded(key))
                             .flatten();
+                        window.set_talk_recording(false);
+                        window.set_keybind_recording(-1);
+                        crate::push_to_talk::set_recording(false);
                         if let Some(recorded) = recorded {
                             let (adapter, weak) = (adapter.clone(), weak.clone());
                             slint::Timer::single_shot(Duration::ZERO, move || {
@@ -535,6 +536,7 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                     }
                     return EventResult::PreventDefault;
                 }
+                let bound = crate::push_to_talk::window_event(event);
                 // Ctrl+K opens the quick switcher, or closes it, wherever the
                 // focus is, as in Discord; not over the settings or a link
                 // that asks before it opens, which the window keeps. Those
@@ -622,7 +624,22 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                     return EventResult::PreventDefault;
                 }
                 let step = match outcome {
-                    zoom::Outcome::Pass => return EventResult::Propagate,
+                    zoom::Outcome::Pass => {
+                        let taken = match bound {
+                            None => false,
+                            Some(crate::push_to_talk::Action::PushToTalk) => {
+                                weak.upgrade().is_some_and(|window| {
+                                    window.get_voice_active() && !window.get_muted()
+                                })
+                            }
+                            Some(_) => true,
+                        };
+                        return if taken {
+                            EventResult::PreventDefault
+                        } else {
+                            EventResult::Propagate
+                        };
+                    }
                     zoom::Outcome::Taken => return EventResult::PreventDefault,
                     zoom::Outcome::Step(step) => step,
                 };

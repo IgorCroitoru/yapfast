@@ -1104,9 +1104,20 @@ export component YapfastWindow inherits Window {
         if !self.settings-open && self.link-phase != 0 { self.cancel-discord-link(); }
         if !self.settings-open { self.camera-testing = false; }
         if !self.settings-open && self.theme-editor { self.cancel-theme(); }
-        if !self.settings-open { self.keybind-recording = -1; self.talk-recording = false; }
+        if !self.settings-open {
+            self.keybind-recording = -1;
+            self.talk-recording = false;
+            self.record-keybind(-1);
+            self.record-talk-key(false);
+        }
     }
     in-out property <int> settings-section;
+    changed settings-section => {
+        self.keybind-recording = -1;
+        self.talk-recording = false;
+        self.record-keybind(-1);
+        self.record-talk-key(false);
+    }
     /// Preferences people set in the settings; preferences-changed reports any change.
     in-out property <bool> twelve-hour-clock;
     in-out property <bool> clock-seconds;

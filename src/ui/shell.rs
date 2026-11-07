@@ -330,10 +330,10 @@ impl Shell {
     fn keybind(&self, key: crate::push_to_talk::Action) {
         use crate::push_to_talk::Action as Key;
         // Pressing a key to record it isn't pressing the keybind it has now.
-        if self
-            .window()
-            .is_some_and(|window| window.get_talk_recording() || window.get_keybind_recording() >= 0)
-        {
+        if self.window().is_some_and(|window| {
+            window.get_settings_open()
+                && (window.get_talk_recording() || window.get_keybind_recording() >= 0)
+        }) {
             return;
         }
         let command = {

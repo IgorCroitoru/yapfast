@@ -10,7 +10,7 @@ component Keycap inherits Rectangle {
     property <bool> glow;
     height: 38px;
     preferred-width: max(108px, label.preferred-width + 28px);
-    accessible-role: text;
+    accessible-role: AccessibleRole.text;
     accessible-label: "Key";
     accessible-value: root.recording ? "Press a key" : root.text != "" ? root.text : "Not set";
     Timer { interval: 550ms; running: root.recording; triggered => { root.glow = !root.glow; } }
@@ -54,7 +54,7 @@ component KeybindRow inherits Rectangle {
     animate background { duration: Theme.quick; }
     opacity: root.other-recording ? 0.5 : 1.0;
     animate opacity { duration: Theme.quick; }
-    accessible-role: groupbox;
+    accessible-role: AccessibleRole.groupbox;
     accessible-label: root.title;
     accessible-description: root.description;
     hover := TouchArea { }

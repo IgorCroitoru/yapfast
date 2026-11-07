@@ -1541,6 +1541,30 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     window.on_record_talk_key(move |on| {
         if let Some(window) = weak.upgrade() {
             window.set_talk_recording(on);
+            if on {
+                window.set_keybind_recording(-1);
+            }
+        }
+    });
+    let weak = window.as_weak();
+    window.on_record_keybind(move |index| {
+        if let Some(window) = weak.upgrade() {
+            window.set_keybind_recording(index);
+            if index >= 0 {
+                window.set_talk_recording(false);
+            }
+        }
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_clear_keybind(move |index| {
+        let action = usize::try_from(index)
+            .ok()
+            .and_then(|index| crate::push_to_talk::Action::TOGGLES.get(index))
+            .copied();
+        if let (Some(window), Some(action)) = (weak.upgrade(), action) {
+            window.set_keybind_recording(-1);
+            state.borrow_mut().clear_keybind(&window, action);
         }
     });
     let state = adapter.clone();
@@ -2235,7 +2259,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     window.on_toggle_mute(move || {
         if let Some(window) = weak.upgrade() {
             if !state.borrow().app.state.voice.active() {
-                state.borrow_mut().toggle_on_join(&window, false);
+                state.borrow_mut().toggle_on_join(Some(&window), false);
                 return;
             }
             let muted = state.borrow().app.state.voice.muted;
@@ -2662,7 +2686,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     window.on_toggle_deafen(move || {
         if let Some(window) = weak.upgrade() {
             if !state.borrow().app.state.voice.active() {
-                state.borrow_mut().toggle_on_join(&window, true);
+                state.borrow_mut().toggle_on_join(Some(&window), true);
                 return;
             }
             let deafened = state.borrow().app.state.voice.deafened;

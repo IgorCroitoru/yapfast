@@ -498,15 +498,21 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                     });
                 }
                 crate::push_to_talk::window_event(event);
-                // While recording the push-to-talk key, the next key becomes
-                // it, and Escape stops; either way only the recorder sees it.
+                // While recording a key for push to talk or a keybind, the
+                // next key becomes it, and Escape stops; either way only the
+                // recorder sees it.
                 if let WindowEvent::KeyboardInput { event: key, .. } = event
                     && key.state == ElementState::Pressed
                     && let Some(window) = weak.upgrade()
-                    && window.get_talk_recording()
+                    && (window.get_talk_recording() || window.get_keybind_recording() >= 0)
                 {
                     if !key.repeat {
+                        let keybind = usize::try_from(window.get_keybind_recording())
+                            .ok()
+                            .and_then(|index| crate::push_to_talk::Action::TOGGLES.get(index))
+                            .copied();
                         window.set_talk_recording(false);
+                        window.set_keybind_recording(-1);
                         let recorded = (key.logical_key != Key::Named(NamedKey::Escape))
                             .then(|| crate::push_to_talk::Keybind::recorded(key))
                             .flatten();
@@ -516,7 +522,13 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                                 if let (Some(adapter), Some(window)) =
                                     (adapter.upgrade(), weak.upgrade())
                                 {
-                                    adapter.borrow_mut().set_talk_key(&window, recorded);
+                                    let mut adapter = adapter.borrow_mut();
+                                    match keybind {
+                                        Some(action) => {
+                                            adapter.set_keybind(&window, action, recorded)
+                                        }
+                                        None => adapter.set_talk_key(&window, recorded),
+                                    }
                                 }
                             });
                         }
@@ -720,11 +732,16 @@ fn type_anywhere(window: &YapfastWindow) {
         if window.get_browsing() && !text.chars().all(|c| c.is_ascii_alphanumeric()) {
             return false;
         }
-        // Holding the key to talk shouldn't also write it.
-        if window.get_voice_active()
-            && !window.get_muted()
-            && crate::push_to_talk::pressed_talk_key()
-        {
+        // Holding the key to talk shouldn't also write it, nor should pressing
+        // a keybind's.
+        let bound = match crate::push_to_talk::pressed_key() {
+            None => false,
+            Some(crate::push_to_talk::Action::PushToTalk) => {
+                window.get_voice_active() && !window.get_muted()
+            }
+            Some(_) => true,
+        };
+        if bound {
             return false;
         }
         window.invoke_type_into_composer()
@@ -1109,6 +1126,11 @@ struct Layout {
     input_mode: InputMode,
     push_to_talk_key: Option<crate::push_to_talk::Keybind>,
     push_to_talk_release_delay: Option<u32>,
+    /// The keys that mute, deafen, or do both, in any app; see
+    /// [`crate::push_to_talk::Action::TOGGLES`]. A key does one thing, so
+    /// none of these shares a key with another or with push to talk.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    keybinds: std::collections::BTreeMap<crate::push_to_talk::Action, crate::push_to_talk::Keybind>,
     /// How loud every call sends the microphone and plays, as sliders'
     /// percentages from 0% to 200%; 100% unless changed.
     microphone_volume: Option<u8>,
@@ -1277,6 +1299,39 @@ impl Layout {
             .min(yapfast_core::push_to_talk::MOST_RELEASE_DELAY)
     }
 
+    /// The keys to watch in any app: push to talk's while that's the input
+    /// mode, then each keybind, in the order Keybinds lists them.
+    fn watched_keys(&self) -> Vec<(crate::push_to_talk::Action, crate::push_to_talk::Keybind)> {
+        use crate::push_to_talk::Action;
+        let talk = self
+            .push_to_talk_key
+            .clone()
+            .filter(|_| self.input_mode == InputMode::PushToTalk)
+            .map(|key| (Action::PushToTalk, key));
+        talk.into_iter()
+            .chain(Action::TOGGLES.into_iter().filter_map(|action| {
+                self.keybinds.get(&action).map(|key| (action, key.clone()))
+            }))
+            .collect()
+    }
+
+    /// The names of the keybinds' keys, in the order Keybinds lists them;
+    /// empty for one without a key.
+    fn keybind_names(&self) -> ModelRc<SharedString> {
+        ModelRc::new(VecModel::from(
+            crate::push_to_talk::Action::TOGGLES
+                .iter()
+                .map(|action| {
+                    self.keybinds
+                        .get(action)
+                        .map(|key| key.name.as_str())
+                        .unwrap_or_default()
+                        .into()
+                })
+                .collect::<Vec<SharedString>>(),
+        ))
+    }
+
     fn read(root: &std::path::Path) -> Self {
         let mut layout: Self = std::fs::read(root.join(LAYOUT))
             .ok()
@@ -1389,6 +1444,7 @@ impl Layout {
                 .into(),
         );
         window.set_talk_delay(self.release_delay() as i32);
+        window.set_keybind_names(self.keybind_names());
         yapfast_core::push_to_talk::set_release_delay(self.release_delay());
         window.set_microphone_volume(self.microphone_volume.unwrap_or(100).into());
         window.set_speaker_volume(self.speaker_volume.unwrap_or(100).into());
@@ -2073,41 +2129,111 @@ impl Adapter {
         }))
     }
 
-    /// Starts, changes or stops watching the push-to-talk key as settings
-    /// say, and shows where it works.
+    /// Starts, changes or stops watching the push-to-talk key, while push to
+    /// talk is on and it's set, and the keybinds, as settings say, and shows
+    /// where they work.
     fn watch_talk_key(&mut self, window: &YapfastWindow) {
-        let wanted = self
-            .layout
-            .push_to_talk_key
-            .as_ref()
-            .filter(|_| self.layout.input_mode == InputMode::PushToTalk);
+        let wanted = self.layout.watched_keys();
         if self
             .talk_key
             .as_ref()
-            .map(crate::push_to_talk::Watcher::key)
-            != wanted
+            .map(crate::push_to_talk::Watcher::keys)
+            .unwrap_or_default()
+            != wanted.as_slice()
         {
             // The old one goes first, ending its portal session.
             self.talk_key = None;
-            self.talk_key = wanted.cloned().map(|key| {
+            self.talk_key = (!wanted.is_empty()).then(|| {
                 let weak = window.as_weak();
-                crate::push_to_talk::Watcher::start(key, &self.runtime, move |reach| {
-                    let _ = weak.upgrade_in_event_loop(move |window| {
-                        window.set_talk_note(reach.note().into());
-                    });
-                })
+                crate::push_to_talk::Watcher::start(
+                    wanted,
+                    &self.runtime,
+                    move |reach| {
+                        let _ = weak.upgrade_in_event_loop(move |window| {
+                            window.set_talk_note(reach.note().into());
+                            window.set_keybinds_note(reach.keybinds_note().into());
+                        });
+                    },
+                    |action| {
+                        // The window may be closed to the tray by then, so
+                        // the shell does it, with the window or without.
+                        let _ = slint::invoke_from_event_loop(move || shell::keybind(action));
+                    },
+                )
             });
         }
-        let note = self.talk_key.as_ref().map(|watcher| watcher.reach().note());
-        window.set_talk_note(note.unwrap_or_default().into());
+        let reach = self
+            .talk_key
+            .as_ref()
+            .map(crate::push_to_talk::Watcher::reach);
+        window.set_talk_note(
+            reach
+                .as_ref()
+                .map(crate::push_to_talk::Reach::note)
+                .unwrap_or_default()
+                .into(),
+        );
+        window.set_keybinds_note(
+            reach
+                .as_ref()
+                .map(crate::push_to_talk::Reach::keybinds_note)
+                .unwrap_or_default()
+                .into(),
+        );
     }
 
     /// Makes a recorded key the push-to-talk key.
     fn set_talk_key(&mut self, window: &YapfastWindow, key: crate::push_to_talk::Keybind) {
         tracing::info!(key = key.name, "push-to-talk key recorded");
         window.set_talk_key(key.name.as_str().into());
+        // A key does one thing: a keybind that had it lets it go.
+        self.layout
+            .keybinds
+            .retain(|_, bound| bound.scancode != key.scancode);
+        window.set_keybind_names(self.layout.keybind_names());
         self.layout.push_to_talk_key = Some(key);
         self.layout.write(&self.root);
+        self.watch_talk_key(window);
+    }
+
+    /// Makes a recorded key what a keybind does.
+    fn set_keybind(
+        &mut self,
+        window: &YapfastWindow,
+        action: crate::push_to_talk::Action,
+        key: crate::push_to_talk::Keybind,
+    ) {
+        tracing::info!(key = key.name, ?action, "keybind recorded");
+        // A key does one thing: the key's old keybind, or push to talk, lets
+        // it go.
+        self.layout
+            .keybinds
+            .retain(|other, bound| *other == action || bound.scancode != key.scancode);
+        if self
+            .layout
+            .push_to_talk_key
+            .as_ref()
+            .is_some_and(|talk| talk.scancode == key.scancode)
+        {
+            self.layout.push_to_talk_key = None;
+            window.set_talk_key(SharedString::default());
+        }
+        self.layout.keybinds.insert(action, key);
+        self.keybinds_changed(window);
+    }
+
+    /// Takes the key off a keybind.
+    fn clear_keybind(&mut self, window: &YapfastWindow, action: crate::push_to_talk::Action) {
+        if self.layout.keybinds.remove(&action).is_some() {
+            tracing::info!(?action, "keybind cleared");
+            self.keybinds_changed(window);
+        }
+    }
+
+    /// Saves the keybinds, shows them, and watches the keys as they are now.
+    fn keybinds_changed(&mut self, window: &YapfastWindow) {
+        self.layout.write(&self.root);
+        window.set_keybind_names(self.layout.keybind_names());
         self.watch_talk_key(window);
     }
 
@@ -2491,8 +2617,10 @@ impl Adapter {
     }
 
     /// Out of a call, mutes or deafens the next one, or stops doing so, with
-    /// the sound it makes in a call. Unmuting undeafens, as in a call.
-    fn toggle_on_join(&mut self, window: &YapfastWindow, deafen: bool) {
+    /// the sound it makes in a call. Unmuting undeafens, as in a call. A
+    /// keybind does it with the window closed to the tray, so it may have no
+    /// window.
+    fn toggle_on_join(&mut self, window: Option<&YapfastWindow>, deafen: bool) {
         let layout = &mut self.layout;
         let sound = if deafen {
             layout.deafen_on_join = !layout.deafen_on_join;
@@ -2509,8 +2637,10 @@ impl Adapter {
             layout.unmute_on_join = Some(unmute);
             if unmute { Sound::Unmute } else { Sound::Mute }
         };
-        window.set_unmute_on_join(layout.unmute_on_join.unwrap_or(true));
-        window.set_deafen_on_join(layout.deafen_on_join);
+        if let Some(window) = window {
+            window.set_unmute_on_join(layout.unmute_on_join.unwrap_or(true));
+            window.set_deafen_on_join(layout.deafen_on_join);
+        }
         layout.write(&self.root);
         self.play(sound);
     }

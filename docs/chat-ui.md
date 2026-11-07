@@ -121,7 +121,8 @@ errors make it taller than the minimum window. SSO and OAuth are still pending.
   a profile, a card, a dialog, a panel such as the pins, the image viewer, a
   ringing call or the call in full screen is open, nor on the friends list or a
   call, nor with Ctrl, Alt or Super held, nor for the push-to-talk key while
-  unmuted in a call. Stepping through the messages, only letters and digits go.
+  unmuted in a call, nor for a keybind's key. Stepping through the messages,
+  only letters and digits go.
 - Clicking a mention, a link to a Matrix user, opens their profile card.
 - Emoji in message text are drawn by Twemoji's picture of them, as the picker's
   are, in a colour bitmap font made of them when Yapfast is built

@@ -324,6 +324,54 @@ impl Shell {
             }
         }
     }
+
+    /// Does what a keybind's key was pressed for, as the call's buttons
+    /// would: out of a call it mutes or deafens the next one.
+    fn keybind(&self, key: crate::push_to_talk::Action) {
+        use crate::push_to_talk::Action as Key;
+        // Pressing a key to record it isn't pressing the keybind it has now.
+        if self
+            .window()
+            .is_some_and(|window| window.get_talk_recording() || window.get_keybind_recording() >= 0)
+        {
+            return;
+        }
+        let command = {
+            let adapter = self.adapter.borrow();
+            let call = &adapter.app.state.voice;
+            if call.active() {
+                match key {
+                    Key::ToggleMute => voice::Command::Mute(!call.muted),
+                    Key::ToggleDeafen => voice::Command::Deafen(!call.deafened),
+                    // Both at once, and both back: unmuting undeafens too.
+                    Key::ToggleMuteAll if call.deafened => voice::Command::Mute(false),
+                    Key::ToggleMuteAll => voice::Command::Deafen(true),
+                    Key::PushToTalk => return,
+                }
+            } else {
+                drop(adapter);
+                let mut adapter = self.adapter.borrow_mut();
+                let deafen = match key {
+                    Key::ToggleMute => false,
+                    Key::ToggleDeafen => true,
+                    // As Deafen in a call mutes too, and undeafening brings
+                    // the microphone back.
+                    Key::ToggleMuteAll => !adapter.layout.deafen_on_join,
+                    Key::PushToTalk => return,
+                };
+                adapter.toggle_on_join(self.window().as_ref(), deafen);
+                return;
+            }
+        };
+        self.act(Action::Voice(command));
+    }
+}
+
+/// A keybind's key was pressed, in any app.
+pub(super) fn keybind(key: crate::push_to_talk::Action) {
+    if let Some(shell) = SHELL.with(|shell| shell.borrow().upgrade()) {
+        shell.keybind(key);
+    }
 }
 
 /// Makes the window again where it was, on Appearance as the setting that

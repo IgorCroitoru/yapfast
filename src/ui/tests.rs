@@ -836,6 +836,55 @@ fn push_to_talk_keeps_its_mode_key_and_release_delay() {
 }
 
 #[test]
+fn keybinds_are_kept_shown_and_watched_with_push_to_talk() {
+    use crate::push_to_talk::Action;
+    i_slint_backend_testing::init_no_event_loop();
+    let defaults: Layout = serde_json::from_str("{}").unwrap();
+    assert!(defaults.keybinds.is_empty());
+    assert!(defaults.watched_keys().is_empty());
+    assert!(
+        serde_json::to_value(&defaults).unwrap().get("keybinds").is_none(),
+        "unset keybinds leave no trace"
+    );
+    let layout: Layout = serde_json::from_value(serde_json::json!({
+        "input_mode": "push_to_talk",
+        "push_to_talk_key": { "scancode": 47, "name": "V" },
+        "keybinds": {
+            "toggle_deafen": { "scancode": 67, "name": "F9" },
+            "toggle_mute": { "scancode": 66, "name": "F8" },
+        },
+    }))
+    .unwrap();
+    assert_eq!(
+        layout
+            .watched_keys()
+            .into_iter()
+            .map(|(action, key)| (action, key.scancode))
+            .collect::<Vec<_>>(),
+        [
+            (Action::PushToTalk, 47),
+            (Action::ToggleMute, 66),
+            (Action::ToggleDeafen, 67),
+        ],
+        "push to talk first, then the keybinds as Keybinds lists them"
+    );
+    let window = classic_window();
+    layout.apply(&window);
+    let names: Vec<String> = window
+        .get_keybind_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    assert_eq!(names, ["F8", "F9", ""]);
+    let saved = serde_json::to_value(&layout).unwrap();
+    assert_eq!(saved["keybinds"]["toggle_mute"]["scancode"], 66);
+    // In voice activity, only the keybinds are watched.
+    let mut voice_activity = layout.clone();
+    voice_activity.input_mode = InputMode::VoiceActivity;
+    assert_eq!(voice_activity.watched_keys().len(), 2);
+}
+
+#[test]
 fn each_sounds_own_volume_counts_only_while_adjusting_each() {
     i_slint_backend_testing::init_no_event_loop();
     let defaults: Layout = serde_json::from_str("{}").unwrap();

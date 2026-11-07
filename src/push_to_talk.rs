@@ -1,8 +1,11 @@
-//! The push-to-talk key, held in any app: through the GlobalShortcuts portal
-//! on Wayland, XInput 2's raw key events on X11, and a low-level keyboard
-//! hook on Windows. Where none of these works, the key works while Yapfast's
-//! window has the focus, and settings say so. Each tells
-//! [`yapfast_core::push_to_talk::hold`] when the key goes down or comes up.
+//! The keys Yapfast watches, pressed in any app: the push-to-talk key, and the
+//! keybinds that mute, deafen or do both. They come through the
+//! GlobalShortcuts portal on Wayland, XInput 2's raw key events on X11, and a
+//! low-level keyboard hook on Windows. Where none of these works, the keys
+//! work while Yapfast's window has the focus, and settings say so. The
+//! push-to-talk key tells [`yapfast_core::push_to_talk::hold`] when it goes
+//! down or comes up; each of the others tells the handler given to
+//! [`Watcher::start`] once per press.
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -140,83 +143,201 @@ fn trigger(_event: &KeyEvent) -> Option<String> {
     None
 }
 
-/// Where the key works.
+/// What a key does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Sends the microphone while held, in push to talk.
+    PushToTalk,
+    /// Mutes the microphone, or unmutes it.
+    ToggleMute,
+    /// Deafens, or undeafens.
+    ToggleDeafen,
+    /// Mutes the microphone and deafens, or brings both back.
+    ToggleMuteAll,
+}
+
+impl Action {
+    pub const ALL: [Action; 4] = [
+        Action::PushToTalk,
+        Action::ToggleMute,
+        Action::ToggleDeafen,
+        Action::ToggleMuteAll,
+    ];
+
+    /// The keybinds that act once per press, in the order settings list them.
+    pub const TOGGLES: [Action; 3] = [
+        Action::ToggleMute,
+        Action::ToggleDeafen,
+        Action::ToggleMuteAll,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The shortcuts a desktop gave, in its words, by what they do; empty
+/// where it hasn't allowed one yet.
+pub type Shortcuts = Vec<(Action, String)>;
+
+/// Where the keys work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// Asking the desktop for it.
+    /// Asking the desktop for them.
     Asking,
-    /// In every app; with the shortcut the desktop gave it, in its own
+    /// In every app; with the shortcuts the desktop gave them, in its own
     /// words, when it says.
-    Everywhere(Option<String>),
+    Everywhere(Option<Shortcuts>),
     /// Only while Yapfast's window has the focus, for this reason, which
     /// the note goes on from.
     Focused(&'static str),
 }
 
 impl Reach {
-    /// What settings say under the key.
+    /// What settings say under the push-to-talk key.
     pub fn note(&self) -> String {
         match self {
             Reach::Asking => "Asking your desktop to let Yapfast use the key in every app...".into(),
             Reach::Everywhere(None) => "Hold the key in any app to talk.".into(),
-            Reach::Everywhere(Some(shortcut)) if shortcut.is_empty() => {
-                "Your desktop hasn't allowed this shortcut yet. Approve it in your system's global shortcuts settings.".into()
+            Reach::Everywhere(Some(shortcuts)) => {
+                match shortcuts.iter().find(|(action, _)| *action == Action::PushToTalk) {
+                    Some((_, shortcut)) if !shortcut.is_empty() => format!(
+                        "Your desktop gave push to talk the shortcut {shortcut}. Hold it in any app to talk; change it in your system's global shortcuts settings."
+                    ),
+                    _ => "Your desktop hasn't allowed this shortcut yet. Approve it in your system's global shortcuts settings.".into(),
+                }
             }
-            Reach::Everywhere(Some(shortcut)) => format!(
-                "Your desktop gave push to talk the shortcut {shortcut}. Hold it in any app to talk; change it in your system's global shortcuts settings."
-            ),
             Reach::Focused(why) => format!(
                 "{why}, so push to talk works only while Yapfast's window is in front."
             ),
         }
     }
+
+    /// What Keybinds say under the keys that mute and deafen.
+    pub fn keybinds_note(&self) -> String {
+        match self {
+            Reach::Asking => "Asking your desktop to let Yapfast use these keys in every app...".into(),
+            Reach::Everywhere(None) => "Your keybinds work in any app.".into(),
+            Reach::Everywhere(Some(shortcuts)) => {
+                let toggles: Vec<_> = shortcuts
+                    .iter()
+                    .filter(|(action, _)| *action != Action::PushToTalk)
+                    .collect();
+                if toggles.is_empty() || toggles.iter().any(|(_, shortcut)| shortcut.is_empty()) {
+                    "Your desktop hasn't allowed these shortcuts yet. Approve them in your system's global shortcuts settings.".into()
+                } else {
+                    "Your desktop manages these shortcuts and may show them differently. Change them in your system's global shortcuts settings.".into()
+                }
+            }
+            Reach::Focused(why) => format!(
+                "{why}, so keybinds work only while Yapfast's window is in front."
+            ),
+        }
+    }
 }
 
-/// The key's scan code while the window's own key events stand in for a
-/// global key; [`NONE`] otherwise.
-static FOCUSED_KEY: AtomicU32 = AtomicU32::new(NONE);
 const NONE: u32 = u32::MAX;
-/// The key's scan code while push to talk watches it, and whether the window's
-/// latest key press was it.
-static TALK_KEY: AtomicU32 = AtomicU32::new(NONE);
-static PRESSED_TALK_KEY: AtomicBool = AtomicBool::new(false);
+/// The scan code of the key each [`Action`] has while it's watched; [`NONE`]
+/// otherwise. Atomics, as a keyboard hook reads them and mustn't wait.
+static KEYS: [AtomicU32; 4] = [
+    AtomicU32::new(NONE),
+    AtomicU32::new(NONE),
+    AtomicU32::new(NONE),
+    AtomicU32::new(NONE),
+];
+/// Whether each action's key is down, so a held key's repeats act once.
+static DOWN: [AtomicBool; 4] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+/// Whether the window's own key events stand in for global keys.
+static FOCUSED: AtomicBool = AtomicBool::new(false);
+/// The action whose key the window's latest key press was, as an index into
+/// [`Action::ALL`]; [`NONE`] if it wasn't one.
+static PRESSED: AtomicU32 = AtomicU32::new(NONE);
 
-/// Whether the key press Slint is handling is the push-to-talk key, which
-/// shouldn't also type into the composer.
-pub fn pressed_talk_key() -> bool {
-    PRESSED_TALK_KEY.load(Ordering::Relaxed)
+type Handler = Arc<dyn Fn(Action) + Send + Sync>;
+/// What hears each press of a keybind other than push to talk.
+static HANDLER: Mutex<Option<Handler>> = Mutex::new(None);
+
+fn bind(action: Action, scancode: Option<u32>) {
+    KEYS[action.index()].store(scancode.unwrap_or(NONE), Ordering::Relaxed);
 }
 
-/// Holds the key from the window's own events while no global key works.
-/// Losing the focus lets it go, as the key's release won't come.
+/// The action a key with this scan code does, if it's watched.
+fn action_for(scancode: u32) -> Option<Action> {
+    if scancode == NONE {
+        return None;
+    }
+    Action::ALL
+        .into_iter()
+        .find(|action| KEYS[action.index()].load(Ordering::Relaxed) == scancode)
+}
+
+/// A watched key went down or came up. Push to talk follows the key; the
+/// other keybinds act as it goes down, and not again until it comes up.
+fn press(action: Action, down: bool) {
+    if action == Action::PushToTalk {
+        yapfast_core::push_to_talk::hold(down);
+        return;
+    }
+    if DOWN[action.index()].swap(down, Ordering::Relaxed) != down && down {
+        let handler = HANDLER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(handler) = handler {
+            handler(action);
+        }
+    }
+}
+
+fn release_all() {
+    for action in Action::ALL {
+        press(action, false);
+    }
+}
+
+/// The action whose key the key press Slint is handling is, which shouldn't
+/// also type into the composer.
+pub fn pressed_key() -> Option<Action> {
+    Action::ALL
+        .get(PRESSED.load(Ordering::Relaxed) as usize)
+        .copied()
+}
+
+/// Presses the keys from the window's own events while no global key works.
+/// Losing the focus lets them go, as their release won't come.
 pub fn window_event(event: &WindowEvent) {
     if let WindowEvent::KeyboardInput { event, .. } = event
         && event.state == ElementState::Pressed
     {
-        let key = TALK_KEY.load(Ordering::Relaxed);
-        PRESSED_TALK_KEY.store(
-            key != NONE && event.physical_key.to_scancode() == Some(key),
+        let action = event.physical_key.to_scancode().and_then(action_for);
+        PRESSED.store(
+            action.map_or(NONE, |action| action.index() as u32),
             Ordering::Relaxed,
         );
     }
-    let key = FOCUSED_KEY.load(Ordering::Relaxed);
-    if key == NONE {
+    if !FOCUSED.load(Ordering::Relaxed) {
         return;
     }
     match event {
-        WindowEvent::KeyboardInput { event, .. }
-            if !event.repeat && event.physical_key.to_scancode() == Some(key) =>
-        {
-            yapfast_core::push_to_talk::hold(event.state == ElementState::Pressed);
+        WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
+            if let Some(action) = event.physical_key.to_scancode().and_then(action_for) {
+                press(action, event.state == ElementState::Pressed);
+            }
         }
-        WindowEvent::Focused(false) => yapfast_core::push_to_talk::hold(false),
+        WindowEvent::Focused(false) => release_all(),
         _ => {}
     }
 }
 
-/// Watches the key in every app it can, until dropped.
+/// Watches the keys in every app it can, until dropped.
 pub struct Watcher {
-    key: Keybind,
+    keys: Vec<(Action, Keybind)>,
     reach: Arc<Mutex<Reach>>,
     #[cfg(target_os = "linux")]
     _global: Option<linux::Global>,
@@ -225,31 +346,36 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Starts watching `key`; `told` hears where it works whenever that
-    /// changes, from any thread.
+    /// Starts watching `keys`; `told` hears where they work whenever that
+    /// changes, from any thread, and `pressed` each press of one that isn't
+    /// push to talk.
     pub fn start(
-        key: Keybind,
+        keys: Vec<(Action, Keybind)>,
         runtime: &BackgroundRuntime,
         told: impl Fn(Reach) + Send + Sync + 'static,
+        pressed: impl Fn(Action) + Send + Sync + 'static,
     ) -> Self {
         let reach = Arc::new(Mutex::new(Reach::Asking));
         let shared = reach.clone();
-        let scancode = key.scancode;
-        TALK_KEY.store(scancode, Ordering::Relaxed);
+        for (action, key) in &keys {
+            bind(*action, Some(key.scancode));
+        }
+        *HANDLER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(pressed));
         let report = Arc::new(move |now: Reach| {
-            let focused = matches!(now, Reach::Focused(_));
-            FOCUSED_KEY.store(if focused { scancode } else { NONE }, Ordering::Relaxed);
+            FOCUSED.store(matches!(now, Reach::Focused(_)), Ordering::Relaxed);
             *shared
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = now.clone();
             told(now);
         });
         #[cfg(target_os = "linux")]
-        let global = linux::Global::start(&key, runtime, report);
+        let global = linux::Global::start(&keys, runtime, report);
         #[cfg(windows)]
         let global = {
             let _ = runtime;
-            windows::Hook::start(scancode, report)
+            windows::Hook::start(report)
         };
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -259,15 +385,16 @@ impl Watcher {
             ));
         }
         Self {
-            key,
+            keys,
             reach,
             #[cfg(any(target_os = "linux", windows))]
             _global: global,
         }
     }
 
-    pub fn key(&self) -> &Keybind {
-        &self.key
+    /// The keys it watches, by what they do.
+    pub fn keys(&self) -> &[(Action, Keybind)] {
+        &self.keys
     }
 
     pub fn reach(&self) -> Reach {
@@ -280,9 +407,14 @@ impl Watcher {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        FOCUSED_KEY.store(NONE, Ordering::Relaxed);
-        TALK_KEY.store(NONE, Ordering::Relaxed);
-        yapfast_core::push_to_talk::hold(false);
+        FOCUSED.store(false, Ordering::Relaxed);
+        for action in Action::ALL {
+            bind(action, None);
+        }
+        release_all();
+        *HANDLER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -315,7 +447,7 @@ mod linux {
         zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value},
     };
 
-    use super::{Keybind, Reach, Report};
+    use super::{Action, Keybind, Reach, Report};
 
     /// A global key on Wayland or X11; stops when dropped.
     pub enum Global {
@@ -326,18 +458,25 @@ mod linux {
     impl Global {
         /// Wayland's desktops grab keys through the portal; X11 lets any
         /// client hear every key.
-        pub fn start(key: &Keybind, runtime: &BackgroundRuntime, report: Report) -> Option<Self> {
+        pub fn start(
+            keys: &[(Action, Keybind)],
+            runtime: &BackgroundRuntime,
+            report: Report,
+        ) -> Option<Self> {
             let wayland =
                 std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
             if wayland {
                 report(Reach::Asking);
-                let trigger = key.trigger.clone();
+                let wanted: Vec<_> = keys
+                    .iter()
+                    .map(|(action, key)| (*action, key.trigger.clone()))
+                    .collect();
                 return Some(Global::Portal {
                     _session: runtime.spawn(async move {
-                        if let Err(error) = portal(trigger, &report).await {
+                        if let Err(error) = portal(wanted, &report).await {
                             tracing::info!(
                                 error = format!("{error:#}"),
-                                "no global push-to-talk key through the portal"
+                                "no global keys through the portal"
                             );
                             report(Reach::Focused(
                                 "Your desktop doesn't offer Yapfast a global shortcut",
@@ -346,16 +485,13 @@ mod linux {
                     }),
                 });
             }
-            match X11::start(key.scancode, report.clone()) {
+            match X11::start(report.clone()) {
                 Ok(x11) => {
                     report(Reach::Everywhere(None));
                     Some(Global::X11 { _events: x11 })
                 }
                 Err(error) => {
-                    tracing::info!(
-                        error = format!("{error:#}"),
-                        "no global push-to-talk key on X11"
-                    );
+                    tracing::info!(error = format!("{error:#}"), "no global keys on X11");
                     report(Reach::Focused("Yapfast couldn't watch keys in other apps"));
                     None
                 }
@@ -366,13 +502,37 @@ mod linux {
     const PORTAL: &str = "org.freedesktop.portal.Desktop";
     const PATH: &str = "/org/freedesktop/portal/desktop";
     const SHORTCUTS: &str = "org.freedesktop.portal.GlobalShortcuts";
-    /// The one shortcut Yapfast binds.
-    const SHORTCUT: &str = "push-to-talk";
 
-    /// Binds the key through the GlobalShortcuts portal and holds it as the
-    /// desktop says, until the task is dropped, which ends the session with
-    /// the connection.
-    async fn portal(trigger: Option<String>, report: &Report) -> Result<()> {
+    /// The id the portal knows an action's shortcut by.
+    fn shortcut_id(action: Action) -> &'static str {
+        match action {
+            Action::PushToTalk => "push-to-talk",
+            Action::ToggleMute => "toggle-mute",
+            Action::ToggleDeafen => "toggle-deafen",
+            Action::ToggleMuteAll => "toggle-mute-all",
+        }
+    }
+
+    fn shortcut_action(id: &str) -> Option<Action> {
+        Action::ALL
+            .into_iter()
+            .find(|action| shortcut_id(*action) == id)
+    }
+
+    /// What the desktop shows a person for an action's shortcut.
+    fn shortcut_description(action: Action) -> &'static str {
+        match action {
+            Action::PushToTalk => "Push to talk",
+            Action::ToggleMute => "Toggle mute",
+            Action::ToggleDeafen => "Toggle deafen",
+            Action::ToggleMuteAll => "Toggle mute and deafen",
+        }
+    }
+
+    /// Binds the keys through the GlobalShortcuts portal and presses them as
+    /// the desktop says, until the task is dropped, which ends the session
+    /// with the connection.
+    async fn portal(wanted: Vec<(Action, Option<String>)>, report: &Report) -> Result<()> {
         let connection = Connection::session().await?;
         // Names Yapfast to the portal, which outside a sandbox can't tell
         // the app otherwise; older portals don't have it.
@@ -418,10 +578,17 @@ mod linux {
             _ => bail!("the portal gave no session"),
         };
 
-        let mut wanted = HashMap::from([("description", Value::from("Push to talk"))]);
-        if let Some(trigger) = &trigger {
-            wanted.insert("preferred_trigger", Value::from(trigger.as_str()));
-        }
+        let shortcuts: Vec<(&str, HashMap<&str, Value>)> = wanted
+            .iter()
+            .map(|(action, trigger)| {
+                let mut details =
+                    HashMap::from([("description", Value::from(shortcut_description(*action)))]);
+                if let Some(trigger) = trigger {
+                    details.insert("preferred_trigger", Value::from(trigger.as_str()));
+                }
+                (shortcut_id(*action), details)
+            })
+            .collect();
         let options = HashMap::from([("handle_token", Value::from(format!("{token}_bind")))]);
         connection
             .call_method(
@@ -429,7 +596,7 @@ mod linux {
                 PATH,
                 Some(SHORTCUTS),
                 "BindShortcuts",
-                &(&session, vec![(SHORTCUT, wanted)], "", options),
+                &(&session, shortcuts, "", options),
             )
             .await?;
         let results = response(&mut signals, &request("bind")).await?;
@@ -447,7 +614,7 @@ mod linux {
                         .deserialize::<(ObjectPath, Vec<(String, HashMap<String, OwnedValue>)>)>()
                         && path == *session
                     {
-                        report(Reach::Everywhere(Some(trigger_description(&shortcuts))));
+                        report(Reach::Everywhere(Some(trigger_descriptions(&shortcuts))));
                     }
                     continue;
                 }
@@ -461,9 +628,9 @@ mod linux {
                     .body()
                     .deserialize::<(ObjectPath, &str, u64, HashMap<String, OwnedValue>)>()
                 && path == *session
-                && id == SHORTCUT
+                && let Some(action) = shortcut_action(id)
             {
-                yapfast_core::push_to_talk::hold(held);
+                super::press(action, held);
             }
         }
         Err(anyhow!("the session bus closed"))
@@ -496,29 +663,34 @@ mod linux {
         Err(anyhow!("the session bus closed"))
     }
 
-    /// The shortcut the desktop bound, in its words; empty when it bound
+    /// The shortcuts the desktop bound, in its words; empty when it bound
     /// none yet.
-    fn described(results: &HashMap<String, OwnedValue>) -> String {
+    fn described(results: &HashMap<String, OwnedValue>) -> super::Shortcuts {
         results
             .get("shortcuts")
             .and_then(|value| {
                 Vec::<(String, HashMap<String, OwnedValue>)>::try_from(value.try_clone().ok()?).ok()
             })
-            .map(|shortcuts| trigger_description(&shortcuts))
+            .map(|shortcuts| trigger_descriptions(&shortcuts))
             .unwrap_or_default()
     }
 
-    fn trigger_description(shortcuts: &[(String, HashMap<String, OwnedValue>)]) -> String {
+    /// Each of Yapfast's shortcuts among them, with the trigger the desktop
+    /// describes for it, or none while it has no trigger.
+    fn trigger_descriptions(
+        shortcuts: &[(String, HashMap<String, OwnedValue>)],
+    ) -> super::Shortcuts {
         shortcuts
             .iter()
-            .find(|(id, _)| id == SHORTCUT)
-            .and_then(|(_, details)| {
-                match details.get("trigger_description").map(|value| &**value) {
-                    Some(Value::Str(text)) => Some(text.to_string()),
-                    _ => None,
-                }
+            .filter_map(|(id, details)| {
+                let action = shortcut_action(id)?;
+                let text = match details.get("trigger_description").map(|value| &**value) {
+                    Some(Value::Str(text)) => text.to_string(),
+                    _ => String::new(),
+                };
+                Some((action, text))
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// XInput 2's raw key events from the root window, which come whatever
@@ -530,7 +702,7 @@ mod linux {
     }
 
     impl X11 {
-        fn start(scancode: u32, report: Report) -> Result<Self> {
+        fn start(report: Report) -> Result<Self> {
             let (connection, screen) = x11rb::connect(None)?;
             let root = connection.setup().roots[screen].root;
             let version = connection.xinput_xi_query_version(2, 2)?.reply()?;
@@ -565,23 +737,27 @@ mod linux {
             let connection = Arc::new(connection);
             let stop = Arc::new(AtomicBool::new(false));
             let (waiting, stopped) = (connection.clone(), stop.clone());
-            // X11 keycodes are evdev's plus 8.
-            let keycode = scancode + 8;
             std::thread::Builder::new()
-                .name("yapfast-talk-key".into())
+                .name("yapfast-keys".into())
                 .spawn(move || {
+                    // X11 keycodes are evdev's plus 8.
+                    let action = |keycode: u32| keycode.checked_sub(8).and_then(super::action_for);
                     while !stopped.load(Ordering::Relaxed) {
                         match waiting.wait_for_event() {
-                            Ok(Event::XinputRawKeyPress(event)) if event.detail == keycode => {
-                                yapfast_core::push_to_talk::hold(true);
+                            Ok(Event::XinputRawKeyPress(event)) => {
+                                if let Some(action) = action(event.detail) {
+                                    super::press(action, true);
+                                }
                             }
-                            Ok(Event::XinputRawKeyRelease(event)) if event.detail == keycode => {
-                                yapfast_core::push_to_talk::hold(false);
+                            Ok(Event::XinputRawKeyRelease(event)) => {
+                                if let Some(action) = action(event.detail) {
+                                    super::press(action, false);
+                                }
                             }
                             Ok(_) => {}
                             Err(error) => {
                                 tracing::warn!(%error, "lost the X server's keys");
-                                yapfast_core::push_to_talk::hold(false);
+                                super::release_all();
                                 report(Reach::Focused("Yapfast lost the X server's keys"));
                                 break;
                             }
@@ -629,7 +805,10 @@ mod linux {
         #[test]
         #[ignore = "needs DISPLAY on a private X server and xdotool"]
         fn x11_hears_the_key_whatever_has_the_focus() {
-            let x11 = X11::start(47, Arc::new(|_| {})).unwrap(); // evdev's V
+            let x11 = {
+                super::super::bind(Action::PushToTalk, Some(47)); // evdev's V
+                X11::start(Arc::new(|_| {})).unwrap()
+            };
             let xdotool = |action| {
                 let status = std::process::Command::new("xdotool")
                     .args([action, "v"])
@@ -772,7 +951,8 @@ mod linux {
             let heard = told.clone();
             let report: Report = Arc::new(move |reach| heard.lock().unwrap().push(reach));
             let runtime = BackgroundRuntime::new().unwrap();
-            let _task = runtime.spawn(async move { portal(Some("v".into()), &report).await });
+            let wanted = vec![(Action::PushToTalk, Some("v".to_owned()))];
+            let _task = runtime.spawn(async move { portal(wanted, &report).await });
             let until = Instant::now() + Duration::from_secs(5);
             while !yapfast_core::push_to_talk::held() {
                 assert!(
@@ -782,9 +962,13 @@ mod linux {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(*told.lock().unwrap(), [Reach::Everywhere(Some("V".into()))]);
+            assert_eq!(
+                *told.lock().unwrap(),
+                [Reach::Everywhere(Some(vec![(Action::PushToTalk, "V".into())]))]
+            );
             let session = OwnedObjectPath::try_from(format!("{PATH}/session/test/1")).unwrap();
-            zbus::block_on(press(server.inner(), &session, SHORTCUT, "Deactivated"));
+            let id = shortcut_id(Action::PushToTalk);
+            zbus::block_on(press(server.inner(), &session, id, "Deactivated"));
             wait_held(false);
         }
     }
@@ -792,13 +976,7 @@ mod linux {
 
 #[cfg(windows)]
 mod windows {
-    use std::{
-        ptr,
-        sync::{
-            atomic::{AtomicU32, Ordering},
-            mpsc,
-        },
-    };
+    use std::{ptr, sync::mpsc};
 
     use windows_sys::Win32::{
         Foundation::{LPARAM, LRESULT, WPARAM},
@@ -812,9 +990,6 @@ mod windows {
 
     use super::{Reach, Report};
 
-    /// The key the hook watches, as winit's scan code.
-    static KEY: AtomicU32 = AtomicU32::new(super::NONE);
-
     /// A low-level keyboard hook on a thread of its own, which sees every
     /// key, its release included, and passes each on. Removed when dropped.
     pub struct Hook {
@@ -822,11 +997,10 @@ mod windows {
     }
 
     impl Hook {
-        pub fn start(scancode: u32, report: Report) -> Option<Self> {
-            KEY.store(scancode, Ordering::Relaxed);
+        pub fn start(report: Report) -> Option<Self> {
             let (started, thread) = mpsc::sync_channel(1);
             let spawned = std::thread::Builder::new()
-                .name("yapfast-talk-key".into())
+                .name("yapfast-keys".into())
                 .spawn(move || {
                     // SAFETY: the hook procedure below only reads the event
                     // Windows hands it; the message loop runs on this thread,
@@ -866,7 +1040,6 @@ mod windows {
 
     impl Drop for Hook {
         fn drop(&mut self) {
-            KEY.store(super::NONE, Ordering::Relaxed);
             // SAFETY: posting to a thread id is harmless if it has ended.
             unsafe {
                 PostThreadMessageW(self.thread, WM_QUIT, 0, 0);
@@ -874,7 +1047,7 @@ mod windows {
         }
     }
 
-    /// Notes the push-to-talk key going down or up, and passes every key on.
+    /// Notes a watched key going down or up, and passes every key on.
     unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             // SAFETY: for HC_ACTION, lparam points at the key's details.
@@ -884,10 +1057,10 @@ mod windows {
             } else {
                 0
             };
-            if key.scanCode | extended == KEY.load(Ordering::Relaxed) {
+            if let Some(action) = super::action_for(key.scanCode | extended) {
                 match wparam as u32 {
-                    WM_KEYDOWN | WM_SYSKEYDOWN => yapfast_core::push_to_talk::hold(true),
-                    WM_KEYUP | WM_SYSKEYUP => yapfast_core::push_to_talk::hold(false),
+                    WM_KEYDOWN | WM_SYSKEYDOWN => super::press(action, true),
+                    WM_KEYUP | WM_SYSKEYUP => super::press(action, false),
                     _ => {}
                 }
             }
@@ -942,7 +1115,8 @@ mod windows {
         #[test]
         #[ignore = "types into the desktop"]
         fn the_hook_hears_the_key_go_down_and_up() {
-            let hook = Hook::start(0x2F, Arc::new(|_| {})).expect("no hook"); // V
+            crate::push_to_talk::bind(crate::push_to_talk::Action::PushToTalk, Some(0x2F)); // V
+            let hook = Hook::start(Arc::new(|_| {})).expect("no hook");
             send(0x2F, false);
             wait_held(true);
             send(0x2F, true);
@@ -953,5 +1127,52 @@ mod windows {
             assert!(!yapfast_core::push_to_talk::held());
             drop(hook);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A key held down presses its keybind once, and again after it comes up.
+    #[test]
+    fn a_held_keybind_acts_once_per_press() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = count.clone();
+        *HANDLER.lock().unwrap() = Some(Arc::new(move |action| {
+            assert_eq!(action, Action::ToggleMute);
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        bind(Action::ToggleMute, Some(7));
+        assert_eq!(action_for(7), Some(Action::ToggleMute));
+        assert_eq!(action_for(8), None);
+        assert_eq!(action_for(NONE), None);
+        press(Action::ToggleMute, true);
+        press(Action::ToggleMute, true);
+        assert_eq!(count.load(Ordering::Relaxed), 1, "its repeats act once");
+        press(Action::ToggleMute, false);
+        assert_eq!(count.load(Ordering::Relaxed), 1, "letting go acts on nothing");
+        press(Action::ToggleMute, true);
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+        press(Action::ToggleMute, false);
+        bind(Action::ToggleMute, None);
+        assert_eq!(action_for(7), None);
+        *HANDLER.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn notes_tell_what_the_desktop_allowed() {
+        let given = Reach::Everywhere(Some(vec![
+            (Action::PushToTalk, "V".into()),
+            (Action::ToggleMute, String::new()),
+        ]));
+        assert!(given.note().contains("gave push to talk the shortcut V"));
+        assert!(given.keybinds_note().contains("hasn't allowed"));
+        let waiting = Reach::Everywhere(Some(vec![(Action::ToggleMute, "F9".into())]));
+        assert!(waiting.note().contains("hasn't allowed"));
+        assert!(waiting.keybinds_note().contains("manages these shortcuts"));
+        assert!(Reach::Everywhere(None).keybinds_note().contains("any app"));
     }
 }

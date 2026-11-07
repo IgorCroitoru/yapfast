@@ -1112,12 +1112,6 @@ export component YapfastWindow inherits Window {
         }
     }
     in-out property <int> settings-section;
-    changed settings-section => {
-        self.keybind-recording = -1;
-        self.talk-recording = false;
-        self.record-keybind(-1);
-        self.record-talk-key(false);
-    }
     /// Preferences people set in the settings; preferences-changed reports any change.
     in-out property <bool> twelve-hour-clock;
     in-out property <bool> clock-seconds;
@@ -1229,6 +1223,8 @@ export component YapfastWindow inherits Window {
         if root.theme-editor && root.settings-section != 7 { root.cancel-theme(); }
         root.keybind-recording = -1;
         root.talk-recording = false;
+        root.record-keybind(-1);
+        root.record-talk-key(false);
     }
     out property <length> message-font-size: root.text-size == 0 ? 14px : root.text-size == 2 ? 18px : ClientStyle.text-size;
     // The sidebar keeps 180 to 380px. Dragging also leaves the conversation 420px;

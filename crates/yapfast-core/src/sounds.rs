@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use realfft::RealFftPlanner;
 use serde::{Deserialize, Serialize};
 
 use crate::audio_io::{Output, RATE};
@@ -75,18 +74,31 @@ static FLUTE: Sample = Sample {
 };
 
 impl Sample {
-    /// The recording at `time` seconds played `speed` times as fast, between
-    /// stored samples by a straight line, and silent past its end.
+    /// The recording at `time` seconds played `speed` times as fast, smoothly
+    /// interpolated between stored samples by a cubic Hermite curve, and silent
+    /// past its end.
     fn at(&self, time: f32, speed: f32) -> f32 {
         let position = time * SAMPLE_RATE * speed;
-        let index = position as usize;
-        let read = |index: usize| {
-            self.pcm.get(index * 2..index * 2 + 2).map_or(0.0, |bytes| {
+        let index = position as isize;
+        let read = |i: isize| {
+            if i < 0 {
+                return 0.0;
+            }
+            let offset = (i as usize) * 2;
+            self.pcm.get(offset..offset + 2).map_or(0.0, |bytes| {
                 f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0
             })
         };
-        let between = position - index as f32;
-        read(index) * (1.0 - between) + read(index + 1) * between
+        let t = position - index as f32;
+        let y0 = read(index - 1);
+        let y1 = read(index);
+        let y2 = read(index + 1);
+        let y3 = read(index + 2);
+        let c0 = y1;
+        let c1 = 0.5 * (y2 - y0);
+        let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+        ((c3 * t + c2) * t + c1) * t + c0
     }
 
     /// One note at `hz`, `time` seconds after it starts. A recording can't
@@ -265,38 +277,10 @@ fn low_pass(samples: &mut [f32], cutoff: f32) {
     }
 }
 
-/// A small, dark room for each ear: 10 ms of quiet, then low-passed noise
-/// fading by 60 dB in 0.3 s, at unit energy. The same every time.
-fn room() -> [Vec<f32>; 2] {
-    let mut seed: u32 = 7;
-    let mut uniform = move || {
-        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        seed as f32 / 4_294_967_296.0
-    };
-    let silent = (0.010 * RATE as f32) as usize;
-    let length = (0.4 * RATE as f32) as usize;
-    std::array::from_fn(|_| {
-        let mut response = vec![0.0f32; silent + length];
-        for (index, sample) in response[silent..].iter_mut().enumerate() {
-            let time = index as f32 / RATE as f32;
-            let noise = (-2.0 * (1.0 - uniform()).ln()).sqrt() * (TAU * uniform()).cos();
-            *sample = noise * (-6.9 * time / 0.3).exp();
-        }
-        low_pass(&mut response[silent..], 2000.0);
-        let energy = response.iter().map(|sample| sample * sample).sum::<f32>();
-        response
-            .iter_mut()
-            .for_each(|sample| *sample /= energy.sqrt());
-        response
-    })
-}
-
 /// Where recorded sets are low-passed: the synthesized ones' 3 kHz would take
-/// the kalimba's ring and the flute's breath, so only the top goes.
-const SAMPLED_CUTOFF: f32 = 9000.0;
-
-/// How much of the room is heard against the sound itself.
-const ROOM: f32 = 0.07;
+/// the kalimba's ring and the flute's breath, while 5.5 kHz keeps the note warm
+/// and strips out high-frequency sample hiss and resampling artifacts.
+const SAMPLED_CUTOFF: f32 = 5500.0;
 
 /// The loudest sounds peak at a quarter of full scale, 12 dB under, so twice
 /// the volume, the slider's 200%, reaches it.
@@ -315,57 +299,14 @@ pub fn render(set: SoundSet, sound: Sound) -> Vec<f32> {
             *sample += velocity * voice(set, hz, index as f32 / RATE as f32, velocity, fade);
         }
     }
-    low_pass(
-        &mut dry,
-        if set.recorded() {
-            SAMPLED_CUTOFF
-        } else {
-            3000.0
-        },
-    );
+    if set.recorded() {
+        low_pass(&mut dry, SAMPLED_CUTOFF);
+        low_pass(&mut dry, SAMPLED_CUTOFF);
+    } else {
+        low_pass(&mut dry, 3000.0);
+    }
 
-    let room = room();
-    let length = (dry.len() + room[0].len()).next_power_of_two();
-    let mut planner = RealFftPlanner::<f32>::new();
-    let forward = planner.plan_fft_forward(length);
-    let inverse = planner.plan_fft_inverse(length);
-    let spectrum = |samples: &[f32]| {
-        let mut input = samples.to_vec();
-        input.resize(length, 0.0);
-        let mut output = forward.make_output_vec();
-        forward
-            .process(&mut input, &mut output)
-            .expect("buffers sized by the plan");
-        output
-    };
-    let sound = spectrum(&dry);
-    let wet: Vec<Vec<f32>> = room
-        .iter()
-        .map(|response| {
-            let mut product: Vec<_> = sound
-                .iter()
-                .zip(spectrum(response))
-                .map(|(a, b)| a * b * ROOM / length as f32)
-                .collect();
-            // Real signals' products are real at either end; rounding aside.
-            for end in [0, product.len() - 1] {
-                product[end].im = 0.0;
-            }
-            let mut output = inverse.make_output_vec();
-            inverse
-                .process(&mut product, &mut output)
-                .expect("buffers sized by the plan");
-            output
-        })
-        .collect();
-
-    let frames = dry.len() + room[0].len() - 1;
-    let mut stereo: Vec<f32> = (0..frames)
-        .flat_map(|frame| {
-            let dry = dry.get(frame).copied().unwrap_or(0.0);
-            [dry + wet[0][frame], dry + wet[1][frame]]
-        })
-        .collect();
+    let mut stereo: Vec<f32> = dry.into_iter().flat_map(|sample| [sample, sample]).collect();
     let peak = stereo
         .iter()
         .fold(0.0f32, |peak, sample| peak.max(sample.abs()));

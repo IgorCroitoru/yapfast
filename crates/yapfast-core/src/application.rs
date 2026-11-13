@@ -23,13 +23,16 @@ mod aside;
 mod browse;
 mod calls;
 mod channel_settings;
+mod commands;
 mod compose;
 mod cosmetics;
 mod discord_account;
+mod ephemeral;
 mod forum;
 mod gifs;
 mod gift;
 mod header;
+mod interactions;
 mod join;
 mod members;
 mod messages;
@@ -48,6 +51,7 @@ mod scheduled_event;
 mod server;
 mod server_settings;
 mod session;
+mod slash;
 mod stickers;
 mod threads;
 
@@ -57,10 +61,12 @@ pub use channel_settings::{
     ChannelInput, ChannelSection, ChannelSettingsScreen, OverwriteConfirm, OverwriteRules,
     OverwriteState, Overwrites, channel_groups, channel_permission,
 };
+pub use commands::{AppCommands, CommandTarget, SlashCommand};
 pub use cosmetics::Cosmetics;
 pub use forum::{ForumInfo, ForumPost, ForumPosts, ForumView};
 pub use gifs::{AskedPicture, GifPicker, GifPicture, GifView};
 pub use gift::GiftDialog;
+pub use interactions::{InteractionModal, Interactions, ModalField, SelectChoice, SelectMenu};
 pub use join::JoinDialog;
 pub use members::{BAN_HISTORY, RoleChoice, TIMEOUT_TIMES};
 #[cfg(all(feature = "discord", any(test, feature = "test-fixtures")))]
@@ -96,6 +102,7 @@ pub use server_settings::{
     SettingsText, SettingsToggle, StickerCard, StickerDraft, StickerInput, StickersPage,
     TransferAsk, WELCOME, WELCOME_STICKER, emoji_name,
 };
+pub use slash::{CommandDraft, CommandRow, OptionDraft};
 pub use stickers::{FREQUENT_STICKERS, ServerStickers, StickerPicker, StickerPicture, StickerUse};
 pub use threads::{
     NewThread, THREAD_NAME_LIMIT, ThreadFrom, ThreadList, ThreadSearch, ThreadSections,
@@ -170,6 +177,9 @@ pub struct PersonDialog {
     /// Their name, as the DM or the server shows it.
     pub name: String,
     pub ask: PersonAsk,
+    /// Where in Discord's client it was asked from, which unfriending and
+    /// blocking tell Discord, such as "ContextMenu".
+    pub location: &'static str,
     /// The note, nickname or reason as it stands; `None` while the note is
     /// on its way.
     pub text: Option<String>,
@@ -426,12 +436,36 @@ pub enum Compose {
         /// Whether the reply notifies the person it replies to.
         ping: bool,
     },
-    /// Editing replaces the draft; cancelling or finishing restores it.
-    Edit { item: String, draft: String },
+}
+
+/// A message of this account's being edited in place, as Discord's inline
+/// editor does: its own field, apart from the room's draft and from a reply
+/// the composer has open. One message is edited at a time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Editing {
+    /// The room the message is in, which may be the thread beside.
+    pub room: String,
+    pub item: String,
+    /// The text as it stands in the field.
+    pub text: String,
+    /// The text the field started with, to tell an edit that changed nothing.
+    pub original: String,
 }
 
 #[derive(Default)]
 pub struct AppState {
+    /// Bots' controls and forms used, waiting for Discord's word.
+    pub interactions: Interactions,
+    /// The open room's apps' commands, once the person typed `/`.
+    pub app_commands: AppCommands,
+    /// A bot's form, open.
+    pub interaction_modal: Option<InteractionModal>,
+    /// The `/` picker and the app command being written in the composer.
+    slash: slash::Slash,
+    /// The message whose control last failed, and what its components say.
+    pub interaction_failed: Option<(String, String)>,
+    /// The choices of a bot's select menu, in a message or a form, open.
+    pub select_menu: Option<SelectMenu>,
     pub voice: voice::State,
     /// Discord is linked on this device and connected.
     pub discord_online: bool,
@@ -495,6 +529,9 @@ pub struct AppState {
     /// it shows.
     pub discord_show_game: bool,
     pub discord_playing: Option<chat::Playing>,
+    /// What the Discord account shows it's doing, on this device and its
+    /// others, as its own profile shows it.
+    pub discord_activities: chat::Activities,
     /// How loud the Discord account's soundboard plays, as Discord keeps
     /// it: from 0 to 100, on its slider's curve.
     pub soundboard_volume: f32,
@@ -713,6 +750,10 @@ pub struct AppState {
     pub viewer: Option<Viewer>,
     /// The video playing in the selected room.
     pub video: Option<chat::Video>,
+    /// The voice message playing, or paused, in the selected room.
+    pub voice_message: Option<chat::VoicePlayback>,
+    /// How fast and loud voice messages play, until Yapfast closes.
+    pub voice_tuning: chat::VoiceTuning,
     /// The profile card that's open.
     pub profile: Option<ProfileView>,
     pub role: Option<RoleView>,
@@ -722,6 +763,7 @@ pub struct AppState {
     pub reset_version: u64,
     drafts: HashMap<String, String>,
     compose: HashMap<String, Compose>,
+    edit: Option<Editing>,
     /// Files waiting in each room's composer for the next message.
     staged: HashMap<String, Vec<chat::Staged>>,
 }
@@ -798,8 +840,9 @@ impl AppState {
             .map_or(&[], Vec::as_slice)
     }
 
-    fn editing(&self) -> bool {
-        matches!(self.compose(), Some(Compose::Edit { .. }))
+    /// The message being edited, in the selected room or the thread beside.
+    pub fn edit(&self) -> Option<&Editing> {
+        self.edit.as_ref()
     }
 
     pub fn compose(&self) -> Option<&Compose> {
@@ -813,6 +856,19 @@ impl AppState {
             .chain(self.aside.iter().flat_map(|aside| aside.messages.iter()))
             .find(|message| message.item == item)
             .map(Arc::as_ref)
+    }
+
+    /// A sent Discord message's link, as Copy Message Link copies it, and
+    /// its id, as Copy Message ID does; none for any other message.
+    pub fn message_link(&self, item: &str) -> Option<(String, String)> {
+        let room = self.room_of(item)?;
+        let id = discord::item_order(item)?;
+        if Network::of(room) != Network::Discord
+            || self.message(item)?.delivery != chat::Delivery::Sent
+        {
+            return None;
+        }
+        Some((format!("{}/{id}", network_link(room)), id.to_string()))
     }
 
     /// Whether this account's devices can write to the selected room.
@@ -871,7 +927,9 @@ impl AppState {
     /// A dialog that takes the keyboard is open, over which the quick
     /// switcher doesn't open and a link handed from outside waits.
     pub fn dialog_open(&self) -> bool {
-        !self.mfa.is_empty()
+        self.interaction_modal.is_some()
+            || self.select_menu.is_some()
+            || !self.mfa.is_empty()
             || self.forwarding.is_some()
             || self.new_dm.is_some()
             || self.add_friend.is_some()
@@ -1244,18 +1302,15 @@ impl AppState {
         people.into_iter().chain(groups).cloned().collect()
     }
 
-    /// Text, or files to go with it; an edit changes only the text.
+    /// Text, or files to go with it.
     pub fn can_send(&self) -> bool {
         self.can_write()
             && self.sending.is_none()
-            && (!self.draft().trim().is_empty() || (!self.editing() && !self.staged().is_empty()))
+            && (!self.draft().trim().is_empty() || !self.staged().is_empty())
     }
 
     pub fn can_attach(&self) -> bool {
-        self.can_write()
-            && !self.preview
-            && !self.editing()
-            && self.staged().len() < chat::MAX_FILES
+        self.can_write() && !self.preview && self.staged().len() < chat::MAX_FILES
     }
 
     /// Why files dropped on the window can't go with the next message, if
@@ -1468,6 +1523,70 @@ pub enum Relation {
 }
 
 pub enum Action {
+    UseButton {
+        item: String,
+        custom_id: String,
+    },
+    OpenSelect {
+        item: String,
+        custom_id: String,
+    },
+    OpenModalSelect(usize),
+    ToggleSelect(usize),
+    SearchSelect(String),
+    SubmitSelect,
+    /// Closes the open menu: a menu of several options sends what changed,
+    /// as Discord's does when its dropdown closes.
+    CloseSelect,
+    /// The form's field at `index` takes `value`: a text input's text, the
+    /// option a radio group picks, the option a checkbox group checks or
+    /// unchecks; a checkbox is checked or unchecked whatever it is.
+    SetModalField {
+        index: usize,
+        value: String,
+    },
+    /// Files for the form's file upload at `index`, after those it has.
+    AddModalFiles {
+        index: usize,
+        files: Vec<PathBuf>,
+    },
+    /// The form's file upload at `index` leaves out its `file`th file.
+    RemoveModalFile {
+        index: usize,
+        file: usize,
+    },
+    SubmitModal,
+    CloseModal,
+    /// The draft is `/` and what follows it, to find an app command by.
+    /// See application/slash.rs.
+    SlashQuery(String),
+    /// One of the commands the picker offers, by its place.
+    PickCommand(usize),
+    /// What the person entered for an option of the command being written.
+    SetCommandOption {
+        index: usize,
+        value: String,
+    },
+    /// Runs the command `command` (its id in the index), on `target`, the
+    /// message item or user a context-menu command acts on, or as written
+    /// in the composer with none.
+    RunAppCommand {
+        command: String,
+        target: Option<String>,
+    },
+    /// A message's or a person's menu opened: asks for the open room's
+    /// command index, unless it's kept, for the menu's "Apps".
+    AskAppCommands,
+    /// The composer writes this option of the command, as Tab or a click on
+    /// its pill moves to it.
+    FocusCommandOption(usize),
+    /// Escape closes the list over the composer, then the command being
+    /// written; with `true`, Backspace in an empty first option puts the
+    /// command's name back to pick another.
+    CloseCommand(bool),
+    /// Hides an ephemeral message, the item, as Discord's "Dismiss message"
+    /// does: only here, with no request. Phase 1d; application/ephemeral.rs.
+    DismissEphemeral(String),
     Navigate(Navigation),
     SelectRoom(String),
     /// Mark a listed conversation read, or every conversation of a listed
@@ -1516,7 +1635,14 @@ pub enum Action {
     CloseNewDm,
     Send,
     Reply(String),
+    /// Open this message of this account's for editing in place.
     Edit(String),
+    /// The text of the open edit's field changed.
+    SetEditText(String),
+    /// Save the open edit; an empty one asks whether to delete the message.
+    SaveEdit,
+    /// Close the open edit, dropping what was typed in it.
+    CancelEdit,
     CancelCompose,
     React {
         item: String,
@@ -1551,6 +1677,9 @@ pub enum Action {
     /// Pin a message of the selected room to its pinned messages, or
     /// unpin it if it's there.
     PinMessage(String),
+    /// Mark a Discord message's channel unread from that message on, as
+    /// Mark Unread in its menu, or Alt+Enter on it, does.
+    MarkUnread(String),
     /// Open the forward dialog for a message of the selected room.
     StartForward(String),
     /// Choose a conversation to forward that message to, or leave it out.
@@ -1603,6 +1732,17 @@ pub enum Action {
     },
     /// Control the video playing.
     Video(chat::VideoCommand),
+    /// Play an item's voice message, or pause it while it plays.
+    ToggleVoiceMessage(String),
+    /// Play voice messages at the next speed: 1, 1.5, then 2 times as fast.
+    CycleVoiceMessageSpeed,
+    /// Play voice messages this loud, from 0 to 1 as the slider stands,
+    /// unmuting them; 0 mutes them.
+    VoiceMessageVolume(f32),
+    /// Mute voice messages, or unmute them at the volume they had.
+    MuteVoiceMessages(bool),
+    /// Move an item's voice message this far through it, from 0 to 1.
+    MoveVoiceMessage(String, f32),
     /// Show the message's next image, or with -1 its previous one, wrapping around.
     StepImage(isize),
     CloseImage,
@@ -2032,17 +2172,21 @@ pub enum Action {
     ResendMfa,
     ConfirmMfa,
     CancelMfa,
-    /// Change how the Discord account stands with someone. Unfriending and
-    /// blocking ask first, through [`Action::AskPerson`].
+    /// Change how the Discord account stands with someone, from `location`
+    /// in Discord's client, such as "ContextMenu". Unfriending and blocking
+    /// ask first, through [`Action::AskPerson`].
     ChangeRelationship {
         user: String,
         change: chat::RelationshipChange,
+        location: &'static str,
     },
-    /// Open a dialog about a Discord user, from their DM's menu; carry out
-    /// what it asks for, with the note or nickname written; or close it.
+    /// Open a dialog about a Discord user, from their DM's menu or
+    /// `location` in Discord's client; carry out what it asks for, with the
+    /// note or nickname written; or close it.
     AskPerson {
         user: String,
         ask: PersonAsk,
+        location: &'static str,
     },
     AnswerPerson(String),
     /// Save this account's note on a Discord user, as the full profile's
@@ -2272,7 +2416,8 @@ pub struct Application {
     /// came: their downloads were called off, and one that comes all the same
     /// isn't kept.
     let_go_emoji: HashSet<String>,
-    /// The profile effects' pictures in `AppState::pictures`.
+    /// The profile cards' own large pictures in `AppState::pictures`: their
+    /// effects', frames' and moving banners'.
     effect_pictures: Vec<String>,
     /// Forwards sent, until each conversation they went to answers.
     forwards: Vec<ForwardSent>,
@@ -2342,6 +2487,9 @@ pub struct Application {
     /// What shows is what was kept, with the newest page on its way, so the
     /// "New" divider isn't placed yet: see [`chat::Direction::Kept`].
     divider_waits: bool,
+    /// The Discord channel or thread on screen that Mark Unread marked
+    /// unread: it isn't read again until it's left, as in Discord's client.
+    held_unread: Option<String>,
     /// [`AppState::seen`] is still to be checked against the selected room's
     /// timeline, once it comes.
     placing_seen: bool,
@@ -2620,6 +2768,12 @@ fn pictures_on_screen<'a>(
                         .filter_map(Option::as_deref)
                         .chain(cosmetics.decoration(profile.decoration.as_deref()))
                         .chain(tag_badge(cosmetics, &profile.tag))
+                        .chain(
+                            cosmetics
+                                .frame(Some(&profile.frame))
+                                .into_iter()
+                                .flat_map(|frame| frame.iter().map(|layer| layer.src.as_str())),
+                        )
                         .chain(profile.bio_emoji.iter().map(|emoji| emoji.picture.as_str()))
                         // Its layers are asked for when it first plays.
                         .chain(effect.into_iter().flat_map(move |effect| {
@@ -2661,12 +2815,17 @@ fn pictures_on_screen<'a>(
                         .reply
                         .as_ref()
                         .and_then(|reply| reply.avatar.as_deref());
+                    let used = message
+                        .used
+                        .as_ref()
+                        .and_then(|used| used.avatar.as_deref());
                     message
                         .avatar
                         .as_deref()
                         .into_iter()
                         .chain(cosmetics.decoration(message.decoration.as_deref()))
                         .chain(reply)
+                        .chain(used)
                         .chain(tag_badge(cosmetics, &message.tag))
                 })
                 .chain(
@@ -2748,7 +2907,10 @@ fn shelved(messages: &[Arc<ChatMessage>]) -> Vec<Arc<ChatMessage>> {
 impl Application {
     pub fn dispatch(&mut self, action: Action) -> Vec<Effect> {
         // A keystroke in the composer shows no picture that wasn't on screen.
-        let composing = matches!(action, Action::SetDraft(_) | Action::MentionQuery(_));
+        let composing = matches!(
+            action,
+            Action::SetDraft(_) | Action::SetEditText(_) | Action::MentionQuery(_)
+        );
         let mut effects = self.dispatch_action(action);
         effects.extend(self.send_pending_message());
         effects.extend(self.show_panel_profile());
@@ -2783,18 +2945,16 @@ impl Application {
         effects
     }
 
-    /// Lets a profile effect's pictures go with its card, rather than with
-    /// the next trim: each is the size of the card, as much as a few hundred
-    /// avatars.
+    /// Lets a profile effect's, frame's or moving banner's pictures go with
+    /// its card, rather than with the next trim: each is about the size of
+    /// the card, as much as a few hundred avatars.
     fn let_go_of_effect_pictures(&mut self) {
         if self.effect_pictures.is_empty() {
             return;
         }
         let state = &self.state;
-        let shown: Vec<&str> = state
-            .profile
-            .iter()
-            .chain(&state.panel_profile)
+        let views = || state.profile.iter().chain(&state.panel_profile);
+        let mut shown: Vec<&str> = views()
             .filter_map(|view| view.profile.effect.as_deref())
             .filter_map(|sku| {
                 state
@@ -2804,9 +2964,16 @@ impl Application {
             })
             .flat_map(|effect| effect.pictures())
             .collect();
+        shown.extend(
+            views().flat_map(|view| view.profile.frame.iter().map(|layer| layer.src.as_str())),
+        );
+        let banners: Vec<String> = views()
+            .filter_map(|view| view.profile.banner.as_deref())
+            .filter_map(chat::moving_banner)
+            .collect();
         let (kept, gone): (Vec<String>, Vec<String>) = std::mem::take(&mut self.effect_pictures)
             .into_iter()
-            .partition(|url| shown.contains(&url.as_str()));
+            .partition(|url| shown.contains(&url.as_str()) || banners.contains(url));
         self.effect_pictures = kept;
         for url in &gone {
             self.state.pictures.remove(url);
@@ -3014,7 +3181,11 @@ impl Application {
             return;
         }
         let emoji = is_custom_emoji(&url);
-        if url.ends_with(chat::EFFECT_PICTURE) {
+        // A card's own large pictures go with it.
+        if url.ends_with(chat::EFFECT_PICTURE)
+            || chat::is_frame_layer(&url)
+            || (url.contains("/banners/") && url.contains(".gif?"))
+        {
             self.effect_pictures.push(url.clone());
         }
         if self.state.pictures.insert(url, picture).is_none() && emoji {
@@ -3057,6 +3228,37 @@ impl Application {
 
     fn dispatch_action(&mut self, action: Action) -> Vec<Effect> {
         match action {
+            Action::UseButton { item, custom_id } => self.use_button(item, custom_id),
+            Action::OpenSelect { item, custom_id } => self.open_select(item, custom_id),
+            Action::OpenModalSelect(index) => self.open_modal_select(index),
+            Action::ToggleSelect(index) => self.toggle_select(index),
+            Action::SearchSelect(query) => self.search_select(query),
+            Action::SubmitSelect => self.submit_select(),
+            Action::CloseSelect => self.close_select(),
+            Action::SetModalField { index, value } => self.set_modal_field(index, value),
+            Action::AddModalFiles { index, files } => self.add_modal_files(index, files),
+            Action::RemoveModalFile { index, file } => self.remove_modal_file(index, file),
+            Action::SubmitModal => self.submit_modal(),
+            Action::SlashQuery(_)
+            | Action::PickCommand(_)
+            | Action::SetCommandOption { .. }
+            | Action::RunAppCommand { .. }
+            | Action::AskAppCommands
+            | Action::FocusCommandOption(_)
+            | Action::CloseCommand(_) => self.command_action(action),
+            Action::DismissEphemeral(item) => self.dismiss_ephemeral(item),
+            Action::CloseModal => {
+                // A form being sent stays until Discord answers.
+                if self
+                    .state
+                    .interaction_modal
+                    .as_ref()
+                    .is_none_or(|modal| modal.nonce.is_none())
+                {
+                    self.state.interaction_modal = None;
+                }
+                vec![]
+            }
             Action::VisibleMessages {
                 room,
                 items,
@@ -3155,7 +3357,10 @@ impl Application {
             Action::SetDraft(body) => self.set_draft(body),
             Action::Send => self.send(),
             Action::Reply(item) => self.reply(item),
-            Action::Edit(item) => self.edit(item),
+            Action::Edit(item) => self.begin_edit(item),
+            Action::SetEditText(text) => self.set_edit_text(text),
+            Action::SaveEdit => self.save_edit(),
+            Action::CancelEdit => self.cancel_edit(),
             Action::CancelCompose => {
                 if let Some(id) = self.state.selected.clone() {
                     self.finish_compose(&id);
@@ -3181,6 +3386,7 @@ impl Application {
             Action::EndPoll => self.end_poll(),
             Action::ShowVoters { item, answer } => self.show_voters(item, answer),
             Action::PinMessage(item) => self.pin_message(item),
+            Action::MarkUnread(item) => self.mark_unread(item),
             Action::StartForward(item) => self.start_forward(item),
             Action::ChooseForward(target) => self.choose_forward(target),
             Action::SearchForward(query) => self.search_forward(query),
@@ -3206,8 +3412,13 @@ impl Application {
                 vec![]
             }
             Action::ConfirmDelete => self.confirm_delete(),
+            Action::Retry(item) if item.starts_with("c:") => self.retry_command(&item),
             Action::Retry(item) => {
                 self.queue_action(item, |room, item| Command::Retry { room, item })
+            }
+            Action::CancelSend(item) if item.starts_with("c:") => {
+                self.cancel_command(&item);
+                vec![]
             }
             Action::CancelSend(item) => {
                 self.queue_action(item, |room, item| Command::Cancel { room, item })
@@ -3232,6 +3443,32 @@ impl Application {
                     self.state.video = None;
                 }
                 vec![Effect::Backend(Command::Video(command))]
+            }
+            Action::ToggleVoiceMessage(item) => self.toggle_voice_message(item),
+            Action::MoveVoiceMessage(item, fraction) => self.move_voice_message(item, fraction),
+            Action::CycleVoiceMessageSpeed => {
+                let speed = &mut self.state.voice_tuning.speed;
+                *speed = if *speed < 1.25 {
+                    1.5
+                } else if *speed < 1.75 {
+                    2.0
+                } else {
+                    1.0
+                };
+                self.tune_voice_message()
+            }
+            Action::VoiceMessageVolume(volume) => {
+                let tuning = &mut self.state.voice_tuning;
+                let volume = volume.clamp(0.0, 1.0);
+                tuning.muted = volume == 0.0;
+                if volume > 0.0 {
+                    tuning.volume = volume;
+                }
+                self.tune_voice_message()
+            }
+            Action::MuteVoiceMessages(muted) => {
+                self.state.voice_tuning.muted = muted;
+                self.tune_voice_message()
             }
             Action::StepImage(step) => self.step_image(step),
             Action::CloseImage => {
@@ -3297,8 +3534,9 @@ impl Application {
             Action::DeclineCall(room) => vec![Effect::Backend(Command::Discord(
                 DiscordCommand::DeclineCall { room },
             ))],
+            // Discord takes no request to someone blocked.
             Action::Befriend(user) => match self.state.relation(&user) {
-                Relation::Stranger | Relation::Incoming => {
+                Relation::Stranger | Relation::Incoming if !self.state.is_blocked(&user) => {
                     vec![Effect::Backend(Command::Discord(DiscordCommand::Friend {
                         user,
                         add: true,
@@ -3557,8 +3795,16 @@ impl Application {
             Action::ResendMfa => self.resend_mfa(),
             Action::ConfirmMfa => self.confirm_mfa(),
             Action::CancelMfa => self.cancel_mfa(),
-            Action::ChangeRelationship { user, change } => self.change_relationship(user, change),
-            Action::AskPerson { user, ask } => self.ask_person(user, ask),
+            Action::ChangeRelationship {
+                user,
+                change,
+                location,
+            } => self.change_relationship(user, change, location),
+            Action::AskPerson {
+                user,
+                ask,
+                location,
+            } => self.ask_person(user, ask, location),
             Action::AnswerPerson(text) => self.answer_person(text),
             Action::ClosePersonDialog => {
                 self.state.person_dialog = None;
@@ -3898,6 +4144,17 @@ impl Application {
 
     fn apply_event(&mut self, event: Event) -> Vec<Effect> {
         match event {
+            Event::InteractionModal(modal) => self.open_interaction_modal(modal),
+            Event::InteractionFailed { nonce, reason } => {
+                self.interaction_answered(&nonce, Some(reason), false)
+            }
+            Event::InteractionSucceeded(nonce) => self.interaction_answered(&nonce, None, false),
+            Event::InteractionSettled(nonce) => self.interaction_answered(&nonce, None, true),
+            // Phase 1 of the bot commands: application/commands.rs.
+            Event::InteractionCreated { .. }
+            | Event::CommandIndex { .. }
+            | Event::CommandIndexChanged { .. }
+            | Event::AutocompleteChoices { .. } => return self.command_event(event),
             Event::Voice(state) => {
                 let sounds = call_sounds(&self.state.voice, &state);
                 // Someone moved the call to another channel, as a bot does
@@ -3963,14 +4220,11 @@ impl Application {
             }
             Event::Picture { url, picture } => self.keep_picture(url, picture),
             Event::Video(video) => {
-                self.state.video = video.filter(|video| {
-                    self.state.selected.as_ref() == Some(&video.room)
-                        || self
-                            .state
-                            .aside
-                            .as_ref()
-                            .is_some_and(|aside| aside.room == video.room)
-                });
+                self.state.video = video.filter(|video| self.state.shows_room(&video.room));
+            }
+            Event::VoiceMessage(playback) => {
+                self.state.voice_message =
+                    playback.filter(|playback| self.state.shows_room(&playback.room));
             }
             // Do Not Disturb holds back message notifications, as in Discord.
             Event::Notify(_) if self.state.do_not_disturb() => {}
@@ -4005,6 +4259,7 @@ impl Application {
                     }
                     self.state.room_ready = true;
                     self.state.messages = self.without_blocked(Arc::new(messages));
+                    self.show_sent_commands();
                     let mut effects = self.place_unread();
                     effects.extend(self.seek());
                     effects.extend(self.read_latest());
@@ -4031,6 +4286,7 @@ impl Application {
             Event::ProfileBoard { user, widgets } => self.profile_board_named(&user, widgets),
             Event::ProfileRecent { user, recent } => self.profile_recent_came(&user, recent),
             Event::BadgeLevels { user, badges } => self.show_badge_levels(&user, badges),
+            Event::ProfileFrame { user, frame } => self.show_profile_frame(&user, &frame),
             Event::ProfileEffect(effect) => {
                 // The few of the cards seen lately.
                 let profile_effects = &mut self.state.profile_effects;
@@ -4370,7 +4626,12 @@ impl Application {
                     self.state.mention_groups = groups;
                 }
             }
-            Event::MemberMatches { room, members, .. } => {
+            Event::MemberMatches {
+                room,
+                query,
+                members,
+            } => {
+                self.select_member_matches(&room, &query, &members);
                 if self.state.selected.as_ref() == Some(&room) {
                     for member in members {
                         if !self
@@ -4428,9 +4689,13 @@ impl Application {
                 }
                 match result {
                     Ok(()) => {
-                        if matches!(self.state.compose.get(&room), Some(Compose::Edit { item: target, .. }) if target == &item)
+                        if self
+                            .state
+                            .edit
+                            .as_ref()
+                            .is_some_and(|edit| edit.room == room && edit.item == item)
                         {
-                            self.finish_compose(&room);
+                            self.state.edit = None;
                         }
                         self.state.notice = None;
                     }

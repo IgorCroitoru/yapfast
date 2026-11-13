@@ -87,6 +87,7 @@ def main():
                SKIA_GN_COMMAND=shutil.which('gn'), SKIA_NINJA_COMMAND=str(ninja),
                BUILD_ARTIFACTSTAGINGDIRECTORY=str(WORK / 'export'),
                CARGO_TARGET_DIR=str(WORK / 'target'))
+    env.setdefault('XWIN_SDK_VERSION', '10.0.22621')
     for name in ['SKIA_BINARIES_URL', 'SKIA_DEBUG', 'SKIA_LIB_SEARCH_PATH',
                  'SKIA_USE_SYSTEM_LIBRARIES']:
         env.pop(name, None)

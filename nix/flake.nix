@@ -106,6 +106,7 @@
           CC = "clang";
           CXX = "clang++";
           PROTOC = "${pkgs.protobuf}/bin/protoc";
+          XWIN_SDK_VERSION = "10.0.22621";
           LK_CUSTOM_WEBRTC = "${windowsWebrtc}";
           YAPFAST_SKIA_WINDOWS_SOURCE = "${windowsSkiaSource}";
           YAPFAST_SKIA_CLANG = "${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang-cl";
